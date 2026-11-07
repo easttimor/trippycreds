@@ -1,0 +1,4 @@
+aws_profile         = "trippycreds-admin"
+aws_region          = "us-east-1"
+alert_emails        = ["you@example.com"]
+expected_account_id = "000000000000"

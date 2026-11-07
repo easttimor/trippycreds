@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/crash.log
+terraform/override.tf
+terraform/override.tf.json
+terraform/build/
+terraform/tfplan*
+terraform/*.tfplan
+terraform/*.tfvars
+terraform/*.tfvars.json
+!terraform/*.tfvars.example

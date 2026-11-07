@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.10"
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+      - name: terraform init (no backend, no credentials needed)
+        run: terraform init -backend=false
+        working-directory: terraform
+      - name: terraform validate
+        run: terraform validate
+        working-directory: terraform
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: byte-compile every module
+        run: |
+          python -m py_compile trippycreds/*.py tooling/*.py lambdas/*/handler.py
+
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: syntax-check app.js
+        run: node --check console/app.js
