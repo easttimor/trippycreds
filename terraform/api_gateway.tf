@@ -37,6 +37,9 @@ locals {
     "POST /canaries/batch-create",
     "POST /canaries/purge-unclaimed",
     "POST /canaries/{access_key_id}/test-trigger",
+    "GET /trusted-principals",
+    "POST /trusted-principals",
+    "POST /trusted-principals/disable",
   ]
 }
 

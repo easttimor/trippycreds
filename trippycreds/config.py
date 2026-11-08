@@ -11,6 +11,13 @@ class Config:
     keys_table_name: str
     events_table_name: str
     sns_topic_arn: str
+    # Optional, unlike the two tables above: only api_backend's Lambda and the
+    # CLI ever touch the trusted-principals registry - event_consumer has no
+    # reason to know this table exists, and its Lambda's Terraform env block
+    # deliberately doesn't set TRUSTED_PRINCIPALS_TABLE. Required-with-no-env-var
+    # would break that Lambda's every invocation; None is harmless here since
+    # Clients() never calls anything on trusted_principals_table unless asked to.
+    trusted_principals_table_name: Optional[str] = None
     aws_region: Optional[str] = None
     aws_profile: Optional[str] = None
     managed_by_tag_value: str = "platform-automation"
@@ -22,6 +29,7 @@ class Config:
             keys_table_name=_require_env("CANARY_KEYS_TABLE"),
             events_table_name=_require_env("CANARY_EVENTS_TABLE"),
             sns_topic_arn=_require_env("SNS_TOPIC_ARN"),
+            trusted_principals_table_name=os.environ.get("TRUSTED_PRINCIPALS_TABLE"),
             aws_region=os.environ.get("AWS_REGION"),
             aws_profile=os.environ.get("AWS_PROFILE"),
             managed_by_tag_value=os.environ.get("MANAGED_BY_TAG_VALUE", "platform-automation"),
@@ -53,6 +61,7 @@ class Config:
                 keys_table_name=outputs["canary_keys_table"]["value"],
                 events_table_name=outputs["canary_events_table"]["value"],
                 sns_topic_arn=outputs["sns_topic_arn"]["value"],
+                trusted_principals_table_name=outputs["trusted_principals_table"]["value"],
                 aws_region=outputs["aws_region"]["value"],
                 aws_profile=outputs["aws_profile"]["value"],
                 managed_by_tag_value=outputs["managed_by_tag_value"]["value"],

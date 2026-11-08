@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from trippycreds import actor as actor_module
 from trippycreds import iam_lifecycle
+from trippycreds import trusted_principals
 from trippycreds.clients import Clients
 
 logger = logging.getLogger()
@@ -17,6 +18,10 @@ class BadRequest(ValueError):
     pass
 
 
+class Forbidden(ValueError):
+    pass
+
+
 def _get_clients() -> Clients:
     global _clients
     if _clients is None:
@@ -26,7 +31,12 @@ def _get_clients() -> Clients:
 
 def handler(event, context):
     clients = _get_clients()
-    route_key = event.get("routeKey")
+    # The HTTP API (console/registry routes, Cognito-authorized) sends
+    # `routeKey`. The REST API (the cross-account service-claim route,
+    # AWS_IAM-authorized - see terraform/rest_api_service.tf) uses the older
+    # v1 proxy event shape instead, with no `routeKey` at all - reconstruct
+    # the same "METHOD /path" form from it so one dispatch table covers both.
+    route_key = event.get("routeKey") or f"{event.get('httpMethod')} {event.get('resource')}"
 
     try:
         if route_key == "GET /canaries":
@@ -41,6 +51,14 @@ def handler(event, context):
             return _handle_purge(clients, event)
         if route_key == "POST /canaries/{access_key_id}/test-trigger":
             return _handle_test_trigger(clients, event)
+        if route_key == "GET /trusted-principals":
+            return _handle_list_trusted_principals(clients, event)
+        if route_key == "POST /trusted-principals":
+            return _handle_register_trusted_principal(clients, event)
+        if route_key == "POST /trusted-principals/disable":
+            return _handle_disable_trusted_principal(clients, event)
+        if route_key == "POST /service/claim":
+            return _handle_service_claim(clients, event)
         return _json_response(404, {"error": f"unknown route: {route_key}"})
     except iam_lifecycle.NoUnclaimedCanariesError as exc:
         return _json_response(409, {"error": str(exc)})
@@ -49,12 +67,15 @@ def handler(event, context):
     except iam_lifecycle.CanaryNotLiveError as exc:
         return _json_response(409, {"error": str(exc)})
     except actor_module.MissingActorError:
-        # Should be unreachable - API Gateway's Cognito authorizer guarantees
-        # verified JWT claims on every route below. Surfacing it distinctly
-        # (rather than the generic 500) makes an authorizer/config regression
-        # obvious instead of looking like an application bug.
+        # Should be unreachable - every route above is behind either API
+        # Gateway's Cognito authorizer (verified JWT claims) or its native
+        # AWS_IAM authorizer (verified SigV4 caller identity). Surfacing this
+        # distinctly (rather than the generic 500) makes an authorizer/config
+        # regression obvious instead of looking like an application bug.
         logger.exception("authenticated request had no usable identity claims")
         return _json_response(500, {"error": "internal error: missing authenticated identity"})
+    except Forbidden as exc:
+        return _json_response(403, {"error": str(exc)})
     except BadRequest as exc:
         return _json_response(400, {"error": str(exc)})
     except Exception:
@@ -81,11 +102,24 @@ def _handle_detail(clients: Clients, event: dict) -> dict:
 
 
 def _actor_from_event(event: dict) -> dict:
-    """The authenticated caller, from the verified JWT claims API Gateway's
-    Cognito authorizer attaches to the request - never from the request body.
+    """The authenticated console/CLI-via-API caller, from the verified JWT
+    claims API Gateway's Cognito authorizer attaches to the request - never
+    from the request body.
     """
     claims = event.get("requestContext", {}).get("authorizer", {}).get("jwt", {}).get("claims", {})
     return actor_module.from_cognito_claims(claims)
+
+
+def _caller_arn_from_iam_auth(event: dict) -> str:
+    """The authenticated service-API caller's ARN, from API Gateway's native
+    AWS_IAM authorizer (which already verified the request's SigV4 signature)
+    - never from the request body. Only the REST API's AWS_IAM-authorized
+    route (POST /service/claim) populates this.
+    """
+    arn = event.get("requestContext", {}).get("identity", {}).get("userArn")
+    if not arn:
+        raise actor_module.MissingActorError("AWS_IAM-authorized request had no caller identity")
+    return arn
 
 
 def _handle_claim(clients: Clients, event: dict) -> dict:
@@ -139,6 +173,70 @@ def _handle_test_trigger(clients: Clients, event: dict) -> dict:
     if result is None:
         return _json_response(404, {"error": "no such canary"})
     return _json_response(200, result)
+
+
+def _handle_list_trusted_principals(clients: Clients, event: dict) -> dict:
+    return _json_response(200, {"items": trusted_principals.list_principals(clients)})
+
+
+def _handle_register_trusted_principal(clients: Clients, event: dict) -> dict:
+    body = _parse_body(event)
+    principal_arn = _require_str(body, "principal_arn")
+    label = _require_str(body, "label")
+    environment = body.get("environment") or None
+    allowed_actions = body.get("allowed_actions") or list(trusted_principals.DEFAULT_ALLOWED_ACTIONS)
+    if not isinstance(allowed_actions, list) or not all(isinstance(a, str) for a in allowed_actions):
+        raise BadRequest("allowed_actions must be a list of strings")
+    item = trusted_principals.register(
+        clients,
+        _actor_from_event(event),
+        principal_arn=principal_arn,
+        label=label,
+        allowed_actions=allowed_actions,
+        environment=environment,
+    )
+    return _json_response(200, item)
+
+
+def _handle_disable_trusted_principal(clients: Clients, event: dict) -> dict:
+    body = _parse_body(event)
+    principal_arn = _require_str(body, "principal_arn")
+    item = trusted_principals.disable(clients, _actor_from_event(event), principal_arn)
+    if item is None:
+        return _json_response(404, {"error": "no such trusted principal"})
+    return _json_response(200, item)
+
+
+def _handle_service_claim(clients: Clients, event: dict) -> dict:
+    """Cross-account, no-operator-in-the-loop claim - see
+    trippycreds/trusted_principals.py and DESIGN.md's "Cross-account service
+    claims" section. Reached only via the separate REST API's AWS_IAM-
+    authorized POST /service/claim route, never the console's HTTP API.
+    """
+    caller_arn = _caller_arn_from_iam_auth(event)
+    registry_item = trusted_principals.is_authorized(clients, caller_arn, action="claim")
+    if registry_item is None:
+        raise Forbidden(f"{caller_arn} is not a trusted principal for 'claim'")
+
+    body = _parse_body(event)
+    placement_description = _require_str(body, "placement_description")
+    environment = _require_str(body, "environment")
+    allowed_environment = registry_item.get("environment")
+    if allowed_environment and allowed_environment != environment:
+        raise Forbidden(
+            f"{registry_item['principal_arn']} is only trusted to claim in environment "
+            f"'{allowed_environment}', not '{environment}'"
+        )
+    placed_by = body.get("placed_by") or registry_item.get("label") or caller_arn
+
+    item = iam_lifecycle.claim(
+        clients,
+        actor_module.from_aws_principal(caller_arn),
+        placement_description=placement_description,
+        placed_by=placed_by,
+        environment=environment,
+    )
+    return _json_response(200, item)
 
 
 def _strip_secret(item: dict) -> dict:

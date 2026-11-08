@@ -51,6 +51,23 @@ data "aws_iam_policy_document" "api_backend_permissions" {
     ]
   }
 
+  # Separate statement (rather than folding into DynamoAccess above) because
+  # this is the only place Scan is needed - the registry is expected to stay
+  # small (one row per trusted service, not per canary), so a full Scan for
+  # list_principals() is fine, but that shouldn't widen Scan access to the
+  # much bigger canary_keys/canary_events tables above.
+  statement {
+    sid    = "TrustedPrincipalsAccess"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Scan",
+    ]
+    resources = [aws_dynamodb_table.trusted_principals.arn]
+  }
+
   # GetAccountSummary is account-wide and doesn't support resource-level or
   # tag-condition scoping - it's a read-only call used only to check headroom
   # against the account's 5,000 IAM user limit before a batch-create.
@@ -136,10 +153,11 @@ resource "aws_lambda_function" "api_backend" {
 
   environment {
     variables = {
-      CANARY_KEYS_TABLE    = aws_dynamodb_table.canary_keys.name
-      CANARY_EVENTS_TABLE  = aws_dynamodb_table.canary_events.name
-      SNS_TOPIC_ARN        = aws_sns_topic.canary_alerts.arn
-      MANAGED_BY_TAG_VALUE = var.managed_by_tag_value
+      CANARY_KEYS_TABLE        = aws_dynamodb_table.canary_keys.name
+      CANARY_EVENTS_TABLE      = aws_dynamodb_table.canary_events.name
+      SNS_TOPIC_ARN            = aws_sns_topic.canary_alerts.arn
+      MANAGED_BY_TAG_VALUE     = var.managed_by_tag_value
+      TRUSTED_PRINCIPALS_TABLE = aws_dynamodb_table.trusted_principals.name
     }
   }
 }

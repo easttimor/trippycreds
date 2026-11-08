@@ -173,6 +173,88 @@ rather than growing a parallel attribution field. `iam_lifecycle.py` and the
 DynamoDB schema don't need to change at all when that lands; only
 `trippycreds/actor.py` and whatever new entry point authenticates the caller do.
 
+## Cross-account service claims
+
+Lets an explicitly trusted AWS principal - e.g. a build server's CodeBuild
+service role, in a different account entirely - claim a canary directly
+through an API, with no operator in the loop. The motivating case: a CI
+pipeline that should inject a fresh canary into every host or config bundle
+it provisions, without a human running `claim` by hand each time.
+
+**Two separate authorization layers, deliberately.** AWS proves *who signed
+the request*; DynamoDB decides *whether that identity is allowed to do
+anything*. Concretely:
+
+- **AWS layer**: the request is SigV4-signed by the caller's own IAM
+  credentials and hits a dedicated API endpoint with `AWS_IAM` authorization.
+  API Gateway verifies the signature and attaches the caller's ARN to the
+  request before it ever reaches application code - a caller can't spoof
+  this any more than a Cognito user can spoof their JWT claims.
+- **Application layer**: that verified ARN is looked up in a
+  `trusted-principals` DynamoDB table
+  (`trippycreds/trusted_principals.py`). No row, a disabled row, or an
+  environment mismatch all mean "no" - identical in spirit to the rest of
+  this system's philosophy (AWS enforces identity, DynamoDB is the
+  authoritative record of who's allowed to do what with it).
+
+Registering a new trusted build server is a DynamoDB write (via the
+console's "Trusted principals" panel, or `register-principal`/
+`list-principals`/`disable-principal` on the CLI) - never a Terraform apply
+and never an IAM trust-policy edit. That's the whole point: onboarding a
+new caller shouldn't require redeploying infrastructure.
+
+### Why this needs a second, separate API Gateway
+
+The console's existing API (`api_gateway.tf`) is an HTTP API
+(`aws_apigatewayv2_api`) with a Cognito JWT authorizer. The natural-looking
+alternative - add an `AWS_IAM`-authorized route to that same API - doesn't
+work: **HTTP APIs don't support resource policies at all.** Resource
+policies are the only mechanism that permits a *cross-account* `AWS_IAM`
+caller to invoke anything; without one, a correctly-SigV4-signed request
+from another account is still denied before it reaches the "is this ARN
+trusted" check. That's a REST-API-only (`aws_api_gateway_rest_api`, "v1")
+feature.
+
+So `terraform/rest_api_service.tf` stands up one small, separate REST API
+carrying only `POST /service/claim`, with a resource policy of
+`Principal: "*"` - intentionally wide open on *who may attempt to invoke*,
+because the real gate is the DynamoDB lookup described above, not this
+policy. The console's HTTP API is untouched; `lambdas/api_backend/handler.py`
+dispatches both APIs' events through the same function, reconstructing a
+`"METHOD /path"` route key for the REST API's older (v1) proxy event shape
+so the two authorizer types share one dispatch table.
+
+Considered and rejected: a cross-account `sts:AssumeRole` trust instead of
+`AWS_IAM` + a resource policy. Trust policies are static IAM resources -
+"register an ARN via the console" would then require a Terraform apply per
+onboarded principal, defeating the actual requirement.
+
+### The assumed-role ARN normalization gotcha
+
+Almost every real caller here is already role-based (an EC2 instance
+profile, an ECS task role, a CodeBuild service role, a cross-account
+`AssumeRole`), and API Gateway hands such a caller's identity to us in STS's
+"assumed-role" form: `arn:aws:sts::<account>:assumed-role/<role-name>/<session-name>`.
+That is *not* the IAM role ARN
+(`arn:aws:iam::<account>:role/<role-name>`) an operator would naturally
+register, and the session-name suffix is caller-controlled and varies per
+call - matching on the raw ARN would never hit. `normalize_principal_arn()`
+collapses the STS form back to the bare role ARN on every registry write and
+every authorization check, so one registration covers every session that
+role ever assumes.
+
+### Scope, deliberately narrow for now
+
+The service API exposes `claim` only - not `batch-create`, `list`, or
+`purge-unclaimed`. A registered principal can also be scoped to a single
+`environment` value at registration time, so a build server can be
+restricted to claiming only for the one environment it actually provisions,
+rather than any canary in the pool. Widening the action set, if a real use
+case needs it (e.g. a service that also wants to batch-create its own
+canaries), is an `allowed_actions` change away - the registry schema already
+supports a list of actions per principal, only `handler.py`'s
+`_handle_service_claim` enforces `"claim"` specifically today.
+
 ## Core infrastructure (Terraform)
 
 Everything below is declarative, in the Terraform root for this account:

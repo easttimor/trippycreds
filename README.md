@@ -80,6 +80,7 @@ the API Lambda (see [DESIGN.md](DESIGN.md)).
 flowchart LR
     Operator(["Operator"])
     Browser["Browser"]
+    TrustedPrincipal(["Trusted principal\n(e.g. build server, cross-account)"])
 
     subgraph Console["Console (static site)"]
         CloudFront["CloudFront"]
@@ -89,13 +90,18 @@ flowchart LR
 
     Cognito["Cognito User Pool"]
 
-    subgraph Api["Console API"]
+    subgraph Api["Console API (HTTP API)"]
         ApiGw["API Gateway\n(Cognito authorizer)"]
         ApiLambda["Lambda: api_backend"]
         ApiGw --> ApiLambda
     end
 
-    Ddb[("DynamoDB\ncanaries + trigger events")]
+    subgraph ServiceApi["Service API (REST API)"]
+        ServiceApiGw["API Gateway\n(AWS_IAM authorizer,\nopen resource policy)"]
+        ServiceApiGw --> ApiLambda
+    end
+
+    Ddb[("DynamoDB\ncanaries + trigger events +\ntrusted-principals registry")]
 
     subgraph IamPool["AWS IAM (pool, not Terraform)"]
         IamUsers["Canary IAM users\n+ access keys\ndeny-all except GetCallerIdentity"]
@@ -120,6 +126,8 @@ flowchart LR
     ApiGw -. validates session .-> Cognito
     Cli --> ApiLambda
     Cli --> IamUsers
+    TrustedPrincipal -- SigV4-signed request --> ServiceApiGw
+    ApiLambda -. checks caller ARN against registry .-> Ddb
     ApiLambda --> Ddb
     ApiLambda --> IamUsers
     IamUsers -. leaked key used by attacker .-> CloudTrail
@@ -307,8 +315,42 @@ python -m tooling.cli purge-unclaimed --execute
 `claim` returns it — copy it immediately, it's not retrievable again.
 
 **Console**: open `console_url`, log in, and use the dashboard — claim,
-batch-create, purge, and view each canary's full trigger timeline with
-CSV/JSON export.
+batch-create, purge, view each canary's full trigger timeline with CSV/JSON
+export, and manage trusted principals for the service API below.
+
+**Service API** (cross-account, no operator in the loop — e.g. a build
+server claiming a canary to inject into a host it provisions): register the
+caller's ARN first, from the console's "Trusted principals" panel or the
+CLI —
+
+```sh
+python -m tooling.cli register-principal --arn arn:aws:iam::222233334444:role/build-server-role \
+  --label "ci-build-server" --environment "prod-honeypot"
+```
+
+— then have that principal call `terraform output -raw service_claim_api_url`
+directly, SigV4-signed with its own AWS credentials (no Cognito session
+involved):
+
+```sh
+curl --aws-sigv4 "aws:amz:$(terraform -chdir=terraform output -raw aws_region):execute-api" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"placement_description": "injected into build job config", "environment": "prod-honeypot"}' \
+  "$(terraform -chdir=terraform output -raw service_claim_api_url)"
+```
+
+(temporary credentials — the normal case for a role — need that
+`x-amz-security-token` header set explicitly: `--aws-sigv4` signs with
+`--user`'s access key/secret, but it does not read `AWS_SESSION_TOKEN` or
+forward it on its own. Omit the header entirely for long-lived IAM user
+keys, which have no session token. Verified working end-to-end against the
+deployed endpoint.)
+
+Full design — why this needs a separate REST API, the assumed-role ARN
+normalization it relies on, and what's deliberately out of scope — is in
+DESIGN.md's "Cross-account service claims" section.
 
 ## Layout
 
@@ -318,7 +360,8 @@ trippycreds/           # shared Python package: IAM lifecycle, event matching,
 tooling/cli.py          # operator CLI
 lambdas/
   event_consumer/       # EventBridge target - matches triggers, records, alerts
-  api_backend/          # HTTP API behind the console
+  api_backend/          # shared handler behind both the console's HTTP API
+                        # and the cross-account service API's REST API
 console/                # the SPA itself - plain HTML/CSS/JS, no build step
 terraform/              # all infrastructure
 scripts/build_lambda.sh # packages the shared package into each Lambda's zip
@@ -349,12 +392,13 @@ scripts/build_lambda.sh # packages the shared package into each Lambda's zip
   protecting the DynamoDB tables directly" for the options being weighed
   (a table resource policy, and/or an Organizations Resource Control Policy
   if/once it covers DynamoDB).
-- **No registry of trusted claiming principals yet.** Today, claiming only
-  happens through an operator's own Cognito session or local CLI credentials.
-  Envisioned: a registry of explicitly trusted principals (by ARN, including
-  cross-account) authorized to claim/place canaries themselves, exposed
-  through an API - enabling automated placement for specific use cases like
-  host provisioning or S3 bucket management without an operator in the loop.
+- **Service-API principals aren't rate-limited per-principal.** The service
+  API's own API Gateway stage has a modest shared throttle
+  (`rest_api_service.tf`), but it's shared across every trusted principal,
+  not scoped per-ARN - one noisy/compromised build server could exhaust a
+  claimed canary's quota against everyone else's budget. Acceptable for a
+  handful of trusted callers; revisit with a per-principal usage plan if
+  that count grows.
 
 ## License
 

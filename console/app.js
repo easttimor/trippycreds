@@ -327,6 +327,21 @@ async function renderDashboard(idToken, status = "unclaimed") {
       <div id="list"></div>
     </section>
 
+    <section class="trusted-principals">
+      <h2>Trusted principals (service API)</h2>
+      <p class="tagline">AWS principals trusted to claim canaries directly via the cross-account service API, no operator in the loop.</p>
+      <div class="trusted-principals-layout">
+        <form id="register-principal-form">
+          <h3>Register</h3>
+          <input name="principal_arn" placeholder="Principal ARN (IAM role or user)" required />
+          <input name="label" placeholder="Label" required />
+          <input name="environment" placeholder="Restrict to environment (optional)" />
+          <button type="submit">Register</button>
+        </form>
+        <div id="trusted-principals-list"><p>Loading…</p></div>
+      </div>
+    </section>
+
     <section id="detail"></section>
   `;
 
@@ -344,6 +359,9 @@ async function renderDashboard(idToken, status = "unclaimed") {
   document.getElementById("claim-form").addEventListener("submit", (e) => onClaimSubmit(e, idToken));
   document.getElementById("batch-create-form").addEventListener("submit", (e) => onBatchCreateSubmit(e, idToken));
   document.getElementById("purge-dry-run-btn").addEventListener("click", (e) => onPurgePreview(idToken, e.target));
+  document
+    .getElementById("register-principal-form")
+    .addEventListener("submit", (e) => onRegisterPrincipalSubmit(e, idToken));
 
   document.getElementById("list-export-csv-btn").addEventListener("click", () =>
     exportRows(currentListItems, LIST_EXPORT_COLUMNS, `canaries-${currentListStatus}`, "csv")
@@ -352,7 +370,7 @@ async function renderDashboard(idToken, status = "unclaimed") {
     exportRows(currentListItems, LIST_EXPORT_COLUMNS, `canaries-${currentListStatus}`, "json")
   );
 
-  await Promise.all([loadList(idToken, status), refreshPoolStats(idToken)]);
+  await Promise.all([loadList(idToken, status), refreshPoolStats(idToken), loadTrustedPrincipals(idToken)]);
 }
 
 function setBanner(html, kind = "info") {
@@ -607,6 +625,90 @@ async function onBatchCreateSubmit(e, idToken) {
       const { items } = await api(idToken, "POST", "/canaries/batch-create", { count });
       setBanner(`Created ${items.length} canary user(s).`, "info");
       await Promise.all([loadList(idToken, "unclaimed"), refreshPoolStats(idToken)]);
+    } catch (err) {
+      setBanner(escapeHtml(err.message), "error");
+    }
+  });
+}
+
+// ---- trusted principals (service API) ----
+
+async function loadTrustedPrincipals(idToken) {
+  const listEl = document.getElementById("trusted-principals-list");
+  listEl.innerHTML = "<p>Loading…</p>";
+  try {
+    const { items } = await api(idToken, "GET", "/trusted-principals");
+    renderTrustedPrincipalsTable(idToken, items);
+  } catch (err) {
+    listEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderTrustedPrincipalsTable(idToken, items) {
+  const listEl = document.getElementById("trusted-principals-list");
+
+  if (items.length === 0) {
+    listEl.innerHTML = "<p>No trusted principals registered.</p>";
+    return;
+  }
+
+  const rows = items
+    .map(
+      (item) => `
+      <tr>
+        <td><code>${escapeHtml(item.principal_arn)}</code></td>
+        <td>${escapeHtml(item.label)}</td>
+        <td>${escapeHtml((item.allowed_actions || []).join(", "))}</td>
+        <td>${escapeHtml(item.environment || "any")}</td>
+        <td><span class="result-badge ${item.enabled ? "ok" : "denied"}">${item.enabled ? "enabled" : "disabled"}</span></td>
+        <td>${
+          item.enabled
+            ? `<button class="link-btn disable-principal-btn" data-arn="${escapeHtml(item.principal_arn)}">Disable</button>`
+            : ""
+        }</td>
+      </tr>`
+    )
+    .join("");
+
+  listEl.innerHTML = `
+    <table>
+      <thead>
+        <tr><th>Principal ARN</th><th>Label</th><th>Actions</th><th>Environment</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  listEl.querySelectorAll(".disable-principal-btn").forEach((btn) => {
+    btn.addEventListener("click", () => onDisablePrincipal(idToken, btn.dataset.arn, btn));
+  });
+}
+
+async function onRegisterPrincipalSubmit(e, idToken) {
+  e.preventDefault();
+  const form = e.target;
+  const button = form.querySelector('button[type="submit"]');
+  const body = {
+    principal_arn: form.principal_arn.value,
+    label: form.label.value,
+  };
+  if (form.environment.value) body.environment = form.environment.value;
+
+  await withLoading(button, "Registering…", async () => {
+    try {
+      await api(idToken, "POST", "/trusted-principals", body);
+      form.reset();
+      await loadTrustedPrincipals(idToken);
+    } catch (err) {
+      setBanner(escapeHtml(err.message), "error");
+    }
+  });
+}
+
+async function onDisablePrincipal(idToken, principalArn, button) {
+  await withLoading(button, "Disabling…", async () => {
+    try {
+      await api(idToken, "POST", "/trusted-principals/disable", { principal_arn: principalArn });
+      await loadTrustedPrincipals(idToken);
     } catch (err) {
       setBanner(escapeHtml(err.message), "error");
     }

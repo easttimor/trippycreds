@@ -3,6 +3,7 @@ import sys
 
 from trippycreds import actor as actor_module
 from trippycreds import iam_lifecycle
+from trippycreds import trusted_principals
 from trippycreds.clients import Clients
 from trippycreds.config import Config
 
@@ -89,6 +90,39 @@ def cmd_list_pool(args, clients: Clients) -> None:
         print(f"  {item['iam_username']}  {item['access_key_id']}{extra}")
 
 
+def cmd_register_principal(args, clients: Clients) -> None:
+    item = trusted_principals.register(
+        clients,
+        _caller_actor(clients),
+        principal_arn=args.arn,
+        label=args.label,
+        allowed_actions=args.actions,
+        environment=args.environment,
+    )
+    env_note = f", environment={item['environment']}" if item.get("environment") else ""
+    print(f"registered {item['principal_arn']} ({item['label']}) - allowed_actions={item['allowed_actions']}{env_note}")
+
+
+def cmd_list_principals(args, clients: Clients) -> None:
+    items = trusted_principals.list_principals(clients)
+    print(f"{len(items)} trusted principal(s):")
+    for item in items:
+        status = "enabled" if item.get("enabled") else "disabled"
+        env_note = f"  environment={item['environment']}" if item.get("environment") else ""
+        print(
+            f"  {item['principal_arn']}  [{status}]  label={item['label']}  "
+            f"actions={item.get('allowed_actions')}{env_note}"
+        )
+
+
+def cmd_disable_principal(args, clients: Clients) -> None:
+    item = trusted_principals.disable(clients, _caller_actor(clients), args.arn)
+    if item is None:
+        print(f"error: no trusted principal registered for {args.arn}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"disabled {item['principal_arn']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trippycreds", description="Manage AWS canary credentials.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -111,6 +145,29 @@ def build_parser() -> argparse.ArgumentParser:
     list_pool = subparsers.add_parser("list-pool", help="list canaries by status")
     list_pool.add_argument("--status", choices=list(iam_lifecycle.VALID_STATUSES), default="unclaimed")
     list_pool.set_defaults(handler=cmd_list_pool)
+
+    register_principal = subparsers.add_parser(
+        "register-principal",
+        help="trust an AWS principal (by ARN, cross-account OK) to claim canaries via the service API",
+    )
+    register_principal.add_argument("--arn", required=True, help="IAM role or user ARN to trust")
+    register_principal.add_argument("--label", required=True)
+    register_principal.add_argument(
+        "--environment", default=None, help="restrict this principal to claiming only this environment value"
+    )
+    register_principal.add_argument(
+        "--actions", nargs="+", default=["claim"], help="service-API actions this principal may perform"
+    )
+    register_principal.set_defaults(handler=cmd_register_principal)
+
+    list_principals = subparsers.add_parser("list-principals", help="list trusted service-API principals")
+    list_principals.set_defaults(handler=cmd_list_principals)
+
+    disable_principal = subparsers.add_parser(
+        "disable-principal", help="revoke a trusted principal's service-API access"
+    )
+    disable_principal.add_argument("--arn", required=True)
+    disable_principal.set_defaults(handler=cmd_disable_principal)
 
     return parser
 

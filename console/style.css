@@ -344,3 +344,24 @@ dd {
   color: var(--muted);
   margin-right: 0.3rem;
 }
+
+.trusted-principals {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.trusted-principals-layout {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.trusted-principals-layout h3 {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}

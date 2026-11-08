@@ -20,3 +20,11 @@ class Clients:
         dynamodb = self.session.resource("dynamodb")
         self.keys_table = dynamodb.Table(self.config.keys_table_name)
         self.events_table = dynamodb.Table(self.config.events_table_name)
+        # None for event_consumer (see Config.trusted_principals_table_name) -
+        # boto3's Table() validates its name argument eagerly, so it can't be
+        # constructed with None the way the other two tables are above.
+        self.trusted_principals_table = (
+            dynamodb.Table(self.config.trusted_principals_table_name)
+            if self.config.trusted_principals_table_name
+            else None
+        )
