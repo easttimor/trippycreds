@@ -393,9 +393,6 @@ scripts/build_lambda.sh # packages the shared package into each Lambda's zip
   our own for data-event or multi-region coverage. See DESIGN.md for the
   detail and the workaround that *did* apply (a tag-conditioned SCP
   statement on `s3:CreateBucket`).
-- **No SCP backstop yet.** Each canary's own inline policy is deny-all except
-  `sts:GetCallerIdentity`, but there's no Org-level SCP enforcing that above
-  IAM as a second layer. Deferred, needs management-account access.
 - **Single shared alert list.** Everyone subscribed to the SNS topic gets
   every canary's alerts; per-claim subscriptions are backlogged.
 - **No alarm on the console/API Lambda.** The event-detection pipeline is
@@ -404,13 +401,15 @@ scripts/build_lambda.sh # packages the shared package into each Lambda's zip
 - **Terraform state is local-only.** No remote backend/locking - fine for a
   single operator, but blocks a second person from ever running `apply`
   safely and has no durability beyond the local `.tfstate.backup` file.
-- **The DynamoDB tables aren't resource-side protected yet.** `canary-keys`
-  holds every live canary's plaintext secret, guarded today only by each
-  Lambda's own least-privilege IAM policy - no resource-based policy on the
-  table itself, no Org-level backstop. See DESIGN.md's "Defense in depth —
-  protecting the DynamoDB tables directly" for the options being weighed
-  (a table resource policy, and/or an Organizations Resource Control Policy
-  if/once it covers DynamoDB).
+- **The DynamoDB tables have an Org-level backstop, but no resource-based
+  policy of their own.** An Org-level RCP now denies `dynamodb:*`
+  account-wide unless the caller is in-org - see DESIGN.md's "Defense in
+  depth — protecting the DynamoDB tables directly." That only covers one
+  path, though: a resource-based policy ever granting an *external* account
+  access to `canary-keys`/`canary-events`. It does nothing about a same-org
+  principal (an over-permissioned role, a compromised admin session) reading
+  the tables directly via an ordinary identity policy - there's still no
+  resource-based policy on the tables themselves constraining that.
 - **Service-API principals aren't rate-limited per-principal.** The service
   API's own API Gateway stage has a modest shared throttle
   (`rest_api_service.tf`), but it's shared across every trusted principal,
