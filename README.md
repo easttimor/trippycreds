@@ -319,14 +319,33 @@ batch-create, purge, view each canary's full trigger timeline with CSV/JSON
 export, and manage trusted principals for the service API below.
 
 **Service API** (cross-account, no operator in the loop — e.g. a build
-server claiming a canary to inject into a host it provisions): register the
-caller's ARN first, from the console's "Trusted principals" panel or the
-CLI —
+server claiming a canary to inject into a host it provisions): this is
+**not** an `sts:AssumeRole` trust — the caller keeps its own identity in its
+own account and just SigV4-signs a request. Two independent steps, in two
+different accounts:
 
-```sh
-python -m tooling.cli register-principal --arn arn:aws:iam::222233334444:role/build-server-role \
-  --label "ci-build-server" --environment "prod-honeypot"
-```
+1. In the caller's account, give its role permission to invoke the one
+   endpoint it needs (nothing else — no DynamoDB/Lambda/S3 access, the
+   trippycreds Lambda does the actual work under its own role):
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Action": "execute-api:Invoke",
+       "Resource": "arn:aws:execute-api:<region>:<trippycreds-account-id>:<service-api-id>/prod/POST/service/claim"
+     }]
+   }
+   ```
+
+2. In the trippycreds account, register that role's ARN, from the console's
+   "Trusted principals" panel or the CLI:
+
+   ```sh
+   python -m tooling.cli register-principal --arn arn:aws:iam::222233334444:role/build-server-role \
+     --label "ci-build-server" --environment "prod-honeypot"
+   ```
 
 — then have that principal call `terraform output -raw service_claim_api_url`
 directly, SigV4-signed with its own AWS credentials (no Cognito session

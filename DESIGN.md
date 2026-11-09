@@ -21,10 +21,16 @@ Two distinct tags, both deliberately mundane-looking so they don't read as
 "honeypot" to a casual console/tag viewer:
 
 - `ManagedBy = platform-automation` — fixed key/value, applied to **every** canary
-  IAM User and every "bait" S3 bucket. Exists purely so Service Control Policies and
-  bucket/IAM policies can reference `aws:PrincipalTag/ManagedBy` /
-  `aws:ResourceTag/ManagedBy` as a condition key. This is the mechanism for
-  defense-in-depth restrictions independent of each user's own inline policy.
+  IAM User and every "bait" S3 bucket, and (via Terraform's provider-level
+  `default_tags`) also to this account's own infrastructure principals, e.g. the
+  two Lambda execution roles in `lambda_api_backend.tf`/`lambda_event_consumer.tf`.
+  That overlap turned out to matter: this is also the tag/value the *Org's own*
+  existing central SCP keys its `s3:CreateBucket` exception on, which is almost
+  certainly why this value was picked in the first place. Originally documented
+  here as the mechanism for the canary-lockdown SCP below - it isn't anymore (see
+  that section for why), precisely because it's shared with non-canary principals.
+  Left in place for the Org-SCP carve-out it already serves; don't repurpose it as
+  a condition key for anything that must match canary IAM Users *only*.
 - `CostCenter = CC-0000 | CC-<batch-id>` — encodes claim status on canary IAM Users
   only. `CC-0000` means unclaimed/pool. Any other value is a batch identifier
   assigned at claim time. Looks like routine billing/tagging hygiene to anyone
@@ -203,6 +209,41 @@ console's "Trusted principals" panel, or `register-principal`/
 and never an IAM trust-policy edit. That's the whole point: onboarding a
 new caller shouldn't require redeploying infrastructure.
 
+### What the trusted role itself needs - and what it doesn't
+
+Easy thing to get backwards: **this is not an `sts:AssumeRole` trust
+relationship.** The trusted build server's role is never assumed *into* the
+trippycreds account, and trippycreds never gets a trust-policy edit for a
+new caller - that alternative was considered and rejected (see below). The
+role keeps its own identity, in its own account, and simply signs a request
+with it.
+
+That means the only AWS-side permission the trusted role needs is one
+`execute-api:Invoke` statement, scoped to the one resource it's allowed to
+call:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "execute-api:Invoke",
+    "Resource": "arn:aws:execute-api:<region>:<trippycreds-account-id>:<service-api-id>/prod/POST/service/claim"
+  }]
+}
+```
+
+(`<service-api-id>` is `terraform output -raw` on the `aws_api_gateway_rest_api.service` resource, or just read off `service_claim_api_url`.) No DynamoDB, Lambda, or S3 permissions, and nothing scoped to resources in the trippycreds account beyond that one API route - the role never touches trippycreds' AWS resources directly. The Lambda behind the API does all the real work, running under *its own* role; the caller's role only has to get a SigV4-signed HTTP request there.
+
+The caller's role also needs a trust policy of its own, but that's about who/what is allowed to assume *that* role in *its own* account (an EC2 instance profile, a CI job, an operator testing by hand) - ordinary same-account IAM, unrelated to trippycreds.
+
+Putting it together, onboarding a new trusted caller is two independent, unrelated actions in two different places:
+
+1. **In the caller's account**: attach the `execute-api:Invoke` policy above to whatever role will do the signing.
+2. **In the trippycreds account**: `register-principal --arn <that role's ARN> --label ... [--environment ...]`.
+
+Neither one touches the other account's IAM, and neither is a Terraform apply.
+
 ### Why this needs a second, separate API Gateway
 
 The console's existing API (`api_gateway.tf`) is an HTTP API
@@ -305,45 +346,139 @@ Everything below is declarative, in the Terraform root for this account:
 Lambda handlers (event-pipeline consumer, API backend) are Python, built from
 the same source tree as the ephemeral IAM lifecycle tooling.
 
-## Defense in depth — Service Control Policy (flagged, not yet scoped)
+## Defense in depth — Service Control Policy (applied)
 
-An Org-level SCP restricting any principal tagged `ManagedBy=platform-automation`
-to essentially nothing, enforced above IAM, would be a strong backstop against a
-future misconfigured inline policy. This requires editing SCPs at the Organization
-(management account or delegated admin) — different credentials/scope than the
-rest of this Terraform, which only touches the dedicated member account. Proposing
-this as a phase-2 item in a separate, small Terraform root once you confirm you
-want it and have decided where that root runs from.
+The inline per-user policy (`Deny *:*` plus `Allow sts:GetCallerIdentity`) is the
+first line of defense, but it's identity-side only: it holds only as long as
+nobody *also* attaches a second, broader policy to a canary user. An SCP backstop
+makes that guarantee hold even against a fully compromised account that tries to
+do exactly that - SCP effective permissions are the intersection of the identity
+policy and the SCP, so an explicit SCP `Deny` wins even over `AdministratorAccess`
+attached directly to the user.
 
-## Defense in depth — protecting the DynamoDB tables directly (flagged, needs research)
+**Targeting, and why not the `ManagedBy` tag.** The original idea (see "Tagging
+strategy" above) was to key this off `aws:PrincipalTag/ManagedBy=platform-automation`.
+Rejected: that tag/value is also stamped onto this account's own Lambda execution
+roles (via Terraform's `default_tags`) and is already load-bearing for an
+unrelated Org-level SCP carve-out - reusing it here would both break the Lambdas
+and risk colliding with that existing exception.
 
-The SCP above restricts canary *IAM principals*. It does nothing to restrict
-who/what can read `canary-keys` directly - and that table holds every live
-canary's plaintext `secret_access_key` plus the full placement/attribution
-record. Today it's protected only by each Lambda role's own IAM policy
-(tag-scoped, least-privilege - see `lambda_api_backend.tf`/`lambda_event_consumer.tf`)
-and by nobody else in this account having a reason to touch it. That's
-identity-side protection; there's no resource-side backstop if some other
-principal in the account (a future broader role, a compromised admin session)
-ends up with DynamoDB permissions it shouldn't.
+Landed on `aws:PrincipalType` instead, which sidesteps tags entirely. This account
+is dedicated to trippycreds and has no other workloads (see "Account" above);
+every human/operator path goes through Identity Center (SSO) roles, and both
+Lambda roles are, naturally, roles - so **every IAM User this account will ever
+have *is* a canary**, structurally, with no tag needed to tell them apart.
+`aws:PrincipalType` resolves to `"User"` only for IAM Users (long-lived
+access-key credentials) - distinct from `"AssumedRole"` (SSO sessions, both
+Lambda roles) and `"Account"` (root) - so it can't be stripped or forged by
+whoever's holding a set of canary credentials, unlike a tag.
 
-Two ways to add one, both worth evaluating rather than committing to yet:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllIamUsersUselessEvenIfGrantedAdmin",
+      "Effect": "Deny",
+      "NotAction": "sts:GetCallerIdentity",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:PrincipalType": "User" }
+      }
+    }
+  ]
+}
+```
 
-- **A resource-based policy on the table itself** (AWS added these for
-  DynamoDB fairly recently) - explicitly deny every principal except the two
-  Lambda roles and the Terraform deploy principal, so it holds even if some
-  other role in the account is accidentally over-permissioned.
-- **An Organizations-level Resource Control Policy (RCP)** - conceptually the
-  resource-side analog of the SCP above, enforced above IAM and (unlike a
-  resource policy you manage yourself) binding even against this account's
-  own admin/root. Whether RCPs currently cover DynamoDB needs checking against
-  current AWS docs before planning around it - unconfirmed as of this
-  writing, and likely to change as AWS has been expanding RCP service
-  coverage.
+**Applied directly to the trippycreds member account** (not the Org root or an
+OU) - the narrowest possible blast radius for a first rollout, consistent with
+AWS's own guidance to test org policies at the account level before promoting
+them higher. Attached manually via the Org management account's console/CLI,
+same as the DynamoDB RCP above; not yet Terraform-codified (same
+management-account-credentials gap noted in "Resolved: SCP timing and scope"
+below). Revisit promoting it to the OU/root level only if there's ever a second
+account that should carry the same guarantee.
 
-Either way, this needs the same Org-management-account access problem flagged
-for the SCP above (see "Resolved: SCP timing and scope") if the RCP route is
-the one taken.
+**SCP syntax note**: unlike the RCP above, SCPs have no `Principal` element at
+all (it's on the SCP "unsupported elements" list - the opposite situation from
+RCPs, where `Principal: "*"` is mandatory). `NotAction` is supported in SCPs,
+which is what this statement relies on.
+
+## Defense in depth — protecting the DynamoDB tables directly (RCP, applied)
+
+The SCP above (once written) only restricts canary *IAM principals*. It does
+nothing to restrict who/what can read `canary-keys` directly - and that table
+holds every live canary's plaintext `secret_access_key` plus the full
+placement/attribution record. Identity-side protection (each Lambda role's own
+tag-scoped IAM policy - see `lambda_api_backend.tf`/`lambda_event_consumer.tf`)
+was the only thing guarding it; there was no resource-side backstop if some
+other principal in the account (a future broader role, a compromised admin
+session) ended up with DynamoDB permissions it shouldn't.
+
+**Resolved**: DynamoDB is on AWS's RCP-supported-services list (confirmed
+against the
+[official list](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html#rcp-supported-services)
+as of Nov 2026 - that list has grown several times since RCPs launched, so
+re-check it before assuming a service not named here is covered). An RCP is
+the resource-side analog of the SCP above: enforced above IAM, and - unlike a
+resource policy you manage yourself - binding even against this account's own
+admin/root. Applied manually in the Org management account (not yet
+Terraform-codified - same access gap flagged in "Resolved: SCP timing and
+scope" below):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceOrgPerimeterDynamoDB",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "dynamodb:*",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": { "aws:PrincipalOrgID": "<org-id>" },
+        "BoolIfExists": { "aws:PrincipalIsAWSService": "false" }
+      }
+    }
+  ]
+}
+```
+
+This denies `dynamodb:*` account-wide unless the caller is in our own Org (or
+is an AWS service acting on our behalf) - a no-op for the Lambda roles
+(same-account, same-org) and for Terraform's deploy principal. It only
+actually bites if a resource-based policy is ever attached to one of these
+tables granting read access to an external account - e.g. to exfiltrate the
+canary registry.
+
+**RCP syntax gotcha, learned the hard way**: RCPs look like SCPs but aren't
+the same grammar. The first attempt at this policy came back
+`MalformedPolicyDocumentException` ("the provided policy document does not
+meet the requirements of the specified policy type") purely because it was
+missing `Principal`. Unlike an SCP (which has no `Principal` element at all -
+it implicitly covers every principal in the attached account/OU), every RCP
+statement **must** include `"Principal": "*"` - you narrow *who* via
+`Condition`, never via `Principal` itself. RCPs also don't support
+`NotPrincipal` or `NotAction` at all (SCPs support both) - worth remembering
+before copy-pasting a statement between policy types, which is exactly how the
+first draft here went wrong.
+
+**Not covered by this (or any) RCP**: the cross-account service-claim API's
+`Principal: "*"` resource policy (`rest_api_service.tf`, see "Cross-account
+service claims" above). `execute-api` is not on the RCP-supported-services
+list, so an Org-wide identity perimeter for that endpoint can't be done this
+way - it has to be enforced in the API Gateway resource policy itself, with an
+`aws:PrincipalOrgID` condition added to the existing `Allow
+execute-api:Invoke` statement. Not yet done; tracked in Backlog below.
+
+Still available as a complementary, independent layer if ever wanted: a
+resource-based policy on the DynamoDB tables themselves (AWS added these for
+DynamoDB fairly recently), explicitly denying every principal except the two
+Lambda roles and the Terraform deploy principal. The RCP above is an Org-wide
+ceiling; a table-level resource policy would be a second, account-local layer
+underneath it - redundant today, but worth it if this account ever grows a
+second workload that also touches DynamoDB.
 
 ## Repo layout (proposed)
 
@@ -359,14 +494,22 @@ trippycreds/
 
 ## Resolved: SCP timing and scope
 
-SCP deferred to a later phase. All Terraform and tooling built now targets only
-the dedicated member account, using a principal that lives in that account — it
-has no Org-management-account access and won't be used to write the SCP. That
-work happens later, from the management account, with different credentials
-entirely.
+SCP is written and attached (see "Defense in depth — Service Control Policy"
+above) - this is no longer deferred. All Terraform and tooling in this repo still
+targets only the dedicated member account, using a principal that lives in that
+account; it has no Org-management-account access and was never used to write the
+SCP. That part of the original plan held: the SCP was authored and attached
+separately, by hand, from the Org management account with different credentials
+entirely - not yet Terraform-codified anywhere.
 
 ## Backlog
 
+- **TODO: add an `aws:PrincipalOrgID` condition to the service-claim API's
+  resource policy** (`rest_api_service.tf`'s `service_api_resource_policy`) -
+  the Org-identity-perimeter equivalent of the DynamoDB RCP in "Defense in
+  depth — protecting the DynamoDB tables directly" above, needed because
+  `execute-api` isn't RCP-supported and so can't be enforced at the Org level
+  the way DynamoDB now is.
 - **Per-claim notification subscriptions.** Right now every claimer shares the
   single SNS topic/subscription list, so everyone gets alerted on every
   canary's trigger. Let the claim form optionally subscribe just the claimer
