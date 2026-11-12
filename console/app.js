@@ -285,6 +285,12 @@ async function renderDashboard(idToken, status = "unclaimed") {
         <input name="placement_description" placeholder="Placement description" required />
         <input name="placed_by" placeholder="Placed by" required />
         <input name="environment" placeholder="Environment" required />
+        <select name="format">
+          <option value="">Plain (access key + secret)</option>
+          <option value="dotenv">.env file</option>
+          <option value="aws-credentials-file">~/.aws/credentials file</option>
+          <option value="shell-export">Shell export</option>
+        </select>
         <button type="submit">Claim</button>
       </form>
 
@@ -342,6 +348,24 @@ async function renderDashboard(idToken, status = "unclaimed") {
       </div>
     </section>
 
+    <section class="housekeeping">
+      <h2>Housekeeping</h2>
+      <div class="housekeeping-layout">
+        <div class="housekeeping-panel">
+          <h3>Reconciliation</h3>
+          <p class="tagline">Diff live IAM state against DynamoDB, and check for AWS-side key quarantines (e.g. GitHub secret scanning) ahead of our own detection.</p>
+          <button id="run-reconcile-btn">Run reconciliation check</button>
+          <div id="reconcile-results"></div>
+        </div>
+        <div class="housekeeping-panel">
+          <h3>Stale canaries</h3>
+          <p class="tagline">Claimed canaries with no recent trigger, and unclaimed pool entries aging past their threshold.</p>
+          <button id="run-stale-report-btn">Refresh report</button>
+          <div id="stale-report-results"></div>
+        </div>
+      </div>
+    </section>
+
     <section id="detail"></section>
   `;
 
@@ -362,6 +386,10 @@ async function renderDashboard(idToken, status = "unclaimed") {
   document
     .getElementById("register-principal-form")
     .addEventListener("submit", (e) => onRegisterPrincipalSubmit(e, idToken));
+  document.getElementById("run-reconcile-btn").addEventListener("click", (e) => onRunReconcile(idToken, e.target));
+  document
+    .getElementById("run-stale-report-btn")
+    .addEventListener("click", (e) => onRunStaleReport(idToken, e.target));
 
   document.getElementById("list-export-csv-btn").addEventListener("click", () =>
     exportRows(currentListItems, LIST_EXPORT_COLUMNS, `canaries-${currentListStatus}`, "csv")
@@ -592,20 +620,31 @@ async function onClaimSubmit(e, idToken) {
     placed_by: form.placed_by.value,
     environment: form.environment.value,
   };
+  if (form.format.value) body.format = form.format.value;
 
   await withLoading(button, "Claiming…", async () => {
     try {
       const item = await api(idToken, "POST", "/canaries/claim", body);
+      const snippetHtml = item.baked_snippet
+        ? `<pre id="baked-snippet">${escapeHtml(item.baked_snippet)}</pre>
+           <button id="copy-snippet-btn" class="link-btn">Copy snippet</button>`
+        : "";
       setBanner(
         `<strong>Claimed ${escapeHtml(item.iam_username)}.</strong> This secret is shown once and never again:<br/>
          access_key_id: <code>${escapeHtml(item.access_key_id)}</code><br/>
          secret_access_key: <code>${escapeHtml(item.secret_access_key)}</code><br/>
-         <button id="download-creds-btn" class="link-btn">Download credentials.json</button>`,
+         <button id="download-creds-btn" class="link-btn">Download credentials.json</button>
+         ${snippetHtml}`,
         "warning"
       );
       document.getElementById("download-creds-btn").addEventListener("click", () =>
         downloadBlob(`${item.iam_username}-credentials.json`, JSON.stringify(item, null, 2), "application/json")
       );
+      if (item.baked_snippet) {
+        document
+          .getElementById("copy-snippet-btn")
+          .addEventListener("click", () => navigator.clipboard.writeText(item.baked_snippet));
+      }
       form.reset();
       await Promise.all([loadList(idToken, "claimed"), refreshPoolStats(idToken)]);
     } catch (err) {
@@ -711,6 +750,78 @@ async function onDisablePrincipal(idToken, principalArn, button) {
       await loadTrustedPrincipals(idToken);
     } catch (err) {
       setBanner(escapeHtml(err.message), "error");
+    }
+  });
+}
+
+// ---- housekeeping (reconciliation + staleness report) ----
+
+async function onRunReconcile(idToken, button) {
+  const resultsEl = document.getElementById("reconcile-results");
+  await withLoading(button, "Checking…", async () => {
+    try {
+      const report = await api(idToken, "POST", "/reconcile");
+      if (report.findings.length === 0) {
+        resultsEl.innerHTML = `<p>No drift or quarantine findings. Checked ${report.iam_user_count} IAM user(s)
+           against ${report.ddb_row_count} DynamoDB row(s).</p>`;
+        return;
+      }
+      const rows = report.findings
+        .map(
+          (f) => `
+          <tr>
+            <td><span class="result-badge ${f.type === "quarantined" ? "denied" : "test"}">${escapeHtml(f.type)}</span></td>
+            <td><code>${escapeHtml(f.iam_username)}</code></td>
+            <td>${escapeHtml(f.status || "-")}</td>
+            <td>${escapeHtml(f.detail)}</td>
+          </tr>`
+        )
+        .join("");
+      resultsEl.innerHTML = `
+        <p>${report.findings.length} finding(s) - an alert was also published to the canary-alerts SNS topic.</p>
+        <table>
+          <thead><tr><th>Type</th><th>IAM user</th><th>Status</th><th>Detail</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    } catch (err) {
+      resultsEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+    }
+  });
+}
+
+async function onRunStaleReport(idToken, button) {
+  const resultsEl = document.getElementById("stale-report-results");
+  await withLoading(button, "Loading…", async () => {
+    try {
+      const report = await api(idToken, "GET", "/reports/stale");
+      const claimedRows = report.stale_claimed
+        .map(
+          (i) => `
+          <tr>
+            <td><code>${escapeHtml(i.iam_username)}</code></td>
+            <td>${escapeHtml(i.claimed_at)}</td>
+            <td>${escapeHtml(i.placement_description || "-")}</td>
+          </tr>`
+        )
+        .join("");
+      const unclaimedRows = report.aging_unclaimed
+        .map(
+          (i) => `<tr><td><code>${escapeHtml(i.iam_username)}</code></td><td>${escapeHtml(i.created_at)}</td></tr>`
+        )
+        .join("");
+      resultsEl.innerHTML = `
+        <p>${report.stale_claimed.length} claimed canary(ies) with no trigger in ≥ ${report.claimed_days_threshold} day(s):</p>
+        <table>
+          <thead><tr><th>IAM user</th><th>Claimed at</th><th>Placement</th></tr></thead>
+          <tbody>${claimedRows || '<tr><td colspan="3">None</td></tr>'}</tbody>
+        </table>
+        <p>${report.aging_unclaimed.length} unclaimed canary(ies) aging past ${report.unclaimed_days_threshold} day(s):</p>
+        <table>
+          <thead><tr><th>IAM user</th><th>Created at</th></tr></thead>
+          <tbody>${unclaimedRows || '<tr><td colspan="2">None</td></tr>'}</tbody>
+        </table>`;
+    } catch (err) {
+      resultsEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
     }
   });
 }

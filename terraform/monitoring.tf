@@ -67,3 +67,22 @@ resource "aws_cloudwatch_metric_alarm" "event_consumer_dlq_depth" {
   alarm_actions       = [aws_sns_topic.canary_alerts.arn]
   ok_actions          = [aws_sns_topic.canary_alerts.arn]
 }
+
+# Fires if the scheduled reconciliation Lambda itself errors - this is about
+# the reconciliation job's own health, not a drift finding it detected, so
+# it reuses the alert topic the same way event_consumer_errors above does.
+resource "aws_cloudwatch_metric_alarm" "reconciler_errors" {
+  alarm_name          = "trippycreds-reconciler-errors"
+  alarm_description   = "TrippyCreds: the scheduled IAM<->DynamoDB reconciliation Lambda is erroring - drift/quarantine findings may be getting missed."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = aws_lambda_function.reconciler.function_name }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.canary_alerts.arn]
+  ok_actions          = [aws_sns_topic.canary_alerts.arn]
+}

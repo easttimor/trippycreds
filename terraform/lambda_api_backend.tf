@@ -124,6 +124,22 @@ data "aws_iam_policy_document" "api_backend_permissions" {
     }
   }
 
+  # For the console's on-demand "run reconciliation now" action (POST
+  # /reconcile, see lambdas/api_backend/handler.py's _handle_reconcile) -
+  # same read-only statement as the scheduled reconciler Lambda's own role
+  # in lambda_reconciler.tf. These List actions don't support resource-level
+  # scoping.
+  statement {
+    sid    = "IamReadOnlyForReconcile"
+    effect = "Allow"
+    actions = [
+      "iam:ListUsers",
+      "iam:ListUserTags",
+      "iam:ListAttachedUserPolicies",
+    ]
+    resources = ["*"]
+  }
+
   statement {
     sid    = "Logs"
     effect = "Allow"

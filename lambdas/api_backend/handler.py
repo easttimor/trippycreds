@@ -4,7 +4,10 @@ import logging
 from decimal import Decimal
 
 from trippycreds import actor as actor_module
+from trippycreds import bake
 from trippycreds import iam_lifecycle
+from trippycreds import reconcile
+from trippycreds import reports
 from trippycreds import trusted_principals
 from trippycreds.clients import Clients
 
@@ -59,6 +62,10 @@ def handler(event, context):
             return _handle_disable_trusted_principal(clients, event)
         if route_key == "POST /service/claim":
             return _handle_service_claim(clients, event)
+        if route_key == "POST /reconcile":
+            return _handle_reconcile(clients, event)
+        if route_key == "GET /reports/stale":
+            return _handle_stale_report(clients, event)
         return _json_response(404, {"error": f"unknown route: {route_key}"})
     except iam_lifecycle.NoUnclaimedCanariesError as exc:
         return _json_response(409, {"error": str(exc)})
@@ -122,6 +129,21 @@ def _caller_arn_from_iam_auth(event: dict) -> str:
     return arn
 
 
+def _apply_format(body: dict, item: dict) -> dict:
+    """Optional, additive: `format` asks for the claimed credentials also
+    rendered as a paste-ready leaked-file snippet (see trippycreds/bake.py).
+    Omitted entirely, the response shape is identical to before this existed.
+    """
+    fmt = body.get("format")
+    if not fmt:
+        return item
+    if fmt not in bake.FORMATS:
+        raise BadRequest(f"format must be one of {bake.FORMATS}")
+    item = dict(item)
+    item["baked_snippet"] = bake.render(item, fmt)
+    return item
+
+
 def _handle_claim(clients: Clients, event: dict) -> dict:
     body = _parse_body(event)
     placement_description = _require_str(body, "placement_description")
@@ -134,7 +156,7 @@ def _handle_claim(clients: Clients, event: dict) -> dict:
         placed_by=placed_by,
         environment=environment,
     )
-    return _json_response(200, item)
+    return _json_response(200, _apply_format(body, item))
 
 
 def _handle_batch_create(clients: Clients, event: dict) -> dict:
@@ -236,7 +258,29 @@ def _handle_service_claim(clients: Clients, event: dict) -> dict:
         placed_by=placed_by,
         environment=environment,
     )
-    return _json_response(200, item)
+    return _json_response(200, _apply_format(body, item))
+
+
+def _handle_reconcile(clients: Clients, event: dict) -> dict:
+    """On-demand version of the scheduled reconciler Lambda (see
+    lambdas/reconciler/handler.py) - same trippycreds/reconcile.py logic,
+    triggered from the console instead of a schedule.
+    """
+    report = reconcile.run(clients)
+    if report["findings"]:
+        reconcile.notify(clients, report)
+    return _json_response(200, report)
+
+
+def _handle_stale_report(clients: Clients, event: dict) -> dict:
+    params = event.get("queryStringParameters") or {}
+    try:
+        claimed_days = int(params.get("claimed_days", reports.DEFAULT_CLAIMED_STALE_DAYS))
+        unclaimed_days = int(params.get("unclaimed_days", reports.DEFAULT_UNCLAIMED_AGING_DAYS))
+    except ValueError as exc:
+        raise BadRequest("claimed_days/unclaimed_days must be integers") from exc
+    report = reports.stale_report(clients, claimed_days=claimed_days, unclaimed_days=unclaimed_days)
+    return _json_response(200, report)
 
 
 def _strip_secret(item: dict) -> dict:

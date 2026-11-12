@@ -40,6 +40,8 @@ locals {
     "GET /trusted-principals",
     "POST /trusted-principals",
     "POST /trusted-principals/disable",
+    "POST /reconcile",
+    "GET /reports/stale",
   ]
 }
 

@@ -2,7 +2,10 @@ import argparse
 import sys
 
 from trippycreds import actor as actor_module
+from trippycreds import bake
 from trippycreds import iam_lifecycle
+from trippycreds import reconcile
+from trippycreds import reports
 from trippycreds import trusted_principals
 from trippycreds.clients import Clients
 from trippycreds.config import Config
@@ -53,6 +56,10 @@ def cmd_claim(args, clients: Clients) -> None:
     print(f"  placed_by:             {item['placed_by']}")
     print(f"  environment:           {item['environment']}")
     print(f"  claimed_by (actor):    {item['claimed_by']}")
+
+    if args.format:
+        print(f"\n--- paste-ready snippet ({args.format}) ---")
+        print(bake.render(item, args.format))
 
 
 def cmd_purge_unclaimed(args, clients: Clients) -> None:
@@ -115,6 +122,39 @@ def cmd_list_principals(args, clients: Clients) -> None:
         )
 
 
+def cmd_reconcile(args, clients: Clients) -> None:
+    report = reconcile.run(clients)
+    print(
+        f"checked {report['iam_user_count']} IAM user(s) against {report['ddb_row_count']} "
+        f"DynamoDB row(s): {len(report['findings'])} finding(s)"
+    )
+    for finding in report["findings"]:
+        print(f"  [{finding['type']}] {finding['iam_username']}: {finding['detail']}")
+    if args.notify and report["findings"]:
+        reconcile.notify(clients, report)
+        print("\npublished alert to the canary-alerts SNS topic.")
+
+
+def cmd_stale_report(args, clients: Clients) -> None:
+    report = reports.stale_report(clients, claimed_days=args.claimed_days, unclaimed_days=args.unclaimed_days)
+    stale_claimed = report["stale_claimed"]
+    aging_unclaimed = report["aging_unclaimed"]
+    print(
+        f"{len(stale_claimed)} claimed canary(ies) with no trigger in >= {args.claimed_days} day(s) "
+        "since being claimed:"
+    )
+    for item in stale_claimed:
+        print(
+            f"  {item['iam_username']}  claimed_at={item['claimed_at']}  "
+            f"placement={item.get('placement_description')}"
+        )
+    print(
+        f"\n{len(aging_unclaimed)} unclaimed canary(ies) sitting in the pool >= {args.unclaimed_days} day(s):"
+    )
+    for item in aging_unclaimed:
+        print(f"  {item['iam_username']}  created_at={item['created_at']}")
+
+
 def cmd_disable_principal(args, clients: Clients) -> None:
     item = trusted_principals.disable(clients, _caller_actor(clients), args.arn)
     if item is None:
@@ -135,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--placement-description", required=True)
     claim.add_argument("--placed-by", required=True)
     claim.add_argument("--environment", required=True)
+    claim.add_argument(
+        "--format",
+        choices=list(bake.FORMATS),
+        default=None,
+        help="also print the claimed credentials as a paste-ready leaked-file snippet",
+    )
     claim.set_defaults(handler=cmd_claim)
 
     purge = subparsers.add_parser("purge-unclaimed", help="delete unclaimed canaries (dry-run by default)")
@@ -168,6 +214,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     disable_principal.add_argument("--arn", required=True)
     disable_principal.set_defaults(handler=cmd_disable_principal)
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile", help="diff live IAM state against DynamoDB and check for AWS-side key quarantines"
+    )
+    reconcile_parser.add_argument(
+        "--notify", action="store_true", help="also publish an SNS alert if findings are detected"
+    )
+    reconcile_parser.set_defaults(handler=cmd_reconcile)
+
+    stale_report = subparsers.add_parser(
+        "stale-report", help="list claimed canaries with no recent trigger and aging unclaimed pool entries"
+    )
+    stale_report.add_argument("--claimed-days", type=int, default=reports.DEFAULT_CLAIMED_STALE_DAYS)
+    stale_report.add_argument("--unclaimed-days", type=int, default=reports.DEFAULT_UNCLAIMED_AGING_DAYS)
+    stale_report.set_defaults(handler=cmd_stale_report)
 
     return parser
 

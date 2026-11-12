@@ -24,3 +24,9 @@ variable "managed_by_tag_value" {
   type        = string
   default     = "platform-automation"
 }
+
+variable "reconciler_schedule_expression" {
+  description = "EventBridge schedule expression for the IAM<->DynamoDB reconciliation Lambda."
+  type        = string
+  default     = "rate(1 day)"
+}

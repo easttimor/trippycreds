@@ -78,7 +78,8 @@ button:disabled {
   filter: none;
 }
 
-input {
+input,
+select {
   background: var(--panel);
   border: 1px solid var(--border);
   color: var(--text);
@@ -86,6 +87,18 @@ input {
   padding: 0.5rem;
   margin-bottom: 0.5rem;
   width: 100%;
+}
+
+pre {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .actions {
@@ -361,6 +374,34 @@ dd {
 }
 
 .trusted-principals-layout h3 {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.housekeeping {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.housekeeping-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.housekeeping-panel {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+
+.housekeeping-panel h3 {
   font-size: 0.85rem;
   color: var(--muted);
   margin: 0 0 0.5rem;

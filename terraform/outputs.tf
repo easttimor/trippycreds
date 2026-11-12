@@ -30,6 +30,10 @@ output "event_consumer_function_name" {
   value = aws_lambda_function.event_consumer.function_name
 }
 
+output "reconciler_function_name" {
+  value = aws_lambda_function.reconciler.function_name
+}
+
 output "console_url" {
   value = "https://${aws_cloudfront_distribution.console.domain_name}/"
 }

@@ -32,6 +32,10 @@ jobs:
       - name: byte-compile every module
         run: |
           python -m py_compile trippycreds/*.py tooling/*.py lambdas/*/handler.py
+      - name: install test dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: pytest
+        run: pytest -q
 
   console:
     runs-on: ubuntu-latest
