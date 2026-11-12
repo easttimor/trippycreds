@@ -35,7 +35,7 @@ jobs:
       - name: install test dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
       - name: pytest
-        run: pytest -q
+        run: python -m pytest -q
 
   console:
     runs-on: ubuntu-latest
