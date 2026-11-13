@@ -472,13 +472,9 @@ way - it has to be enforced in the API Gateway resource policy itself, with an
 `aws:PrincipalOrgID` condition added to the existing `Allow
 execute-api:Invoke` statement. Not yet done; tracked in Backlog below.
 
-Still available as a complementary, independent layer if ever wanted: a
-resource-based policy on the DynamoDB tables themselves (AWS added these for
-DynamoDB fairly recently), explicitly denying every principal except the two
-Lambda roles and the Terraform deploy principal. The RCP above is an Org-wide
-ceiling; a table-level resource policy would be a second, account-local layer
-underneath it - redundant today, but worth it if this account ever grows a
-second workload that also touches DynamoDB.
+Added as a complementary, independent layer underneath this RCP: a
+resource-based policy on each DynamoDB table itself. See "Resolved:
+per-table DynamoDB resource-based policies" below.
 
 ## Repo layout (proposed)
 
@@ -501,6 +497,51 @@ account; it has no Org-management-account access and was never used to write the
 SCP. That part of the original plan held: the SCP was authored and attached
 separately, by hand, from the Org management account with different credentials
 entirely - not yet Terraform-codified anywhere.
+
+## Resolved: per-table DynamoDB resource-based policies
+
+The Org-level RCP above (see "Defense in depth — protecting the DynamoDB
+tables directly") only restricts principals *outside* this Org. It does
+nothing about a same-org principal - an over-permissioned role, a
+compromised admin session - reading `canary-keys`, `canary-events` or
+`trusted-principals` directly via an ordinary identity policy; identity and
+resource policies are combined with OR (an Allow from either side grants
+access) unless a policy carries an explicit Deny, and there was no
+resource-based policy on the tables themselves to provide one.
+
+Resolved in `terraform/dynamodb_resource_policy.tf`: each of the three
+tables now gets its own `aws_dynamodb_resource_policy` - a single `Deny
+dynamodb:*` statement, scoped via `Condition: StringNotLike
+aws:PrincipalArn` to everyone *except* that table's expected principals
+(the Lambda roles that already have narrow, resource-scoped identity
+policies for it - see `lambda_api_backend.tf`/`lambda_event_consumer.tf`/
+`lambda_reconciler.tf` - plus `trippycreds-deploy` for Terraform and the
+CLI). `trusted-principals` is included too, even though the RCP writeup
+above only named the other two - a role that could write there could
+register itself as a trusted cross-account claimant, which is its own kind
+of sensitive.
+
+Two deliberate choices worth flagging:
+- **`aws:PrincipalArn` + `StringNotLike`, not `NotPrincipal` with literal
+  role ARNs.** `NotPrincipal` resolves role ARNs to their internal unique ID
+  at policy-save time, so a role deleted and recreated under the same
+  name/ARN would silently fall out of the allow-list. `aws:PrincipalArn` is
+  a live string match, so it keeps working across role recreation.
+- **`trippycreds-admin` (the human AdministratorAccess SSO role) is not
+  allow-listed - only `trippycreds-deploy` is.** Operator/CLI access per the
+  "Account" section above is expected to go through SSO roles in general,
+  but any direct DynamoDB access now has to go through the narrower deploy
+  role specifically (already the CLI's default profile - see
+  `trippycreds/config.py`), not raw admin. This also sidesteps hardcoding
+  Identity Center's auto-generated permission-set role ARN suffix, which
+  isn't stable to begin with.
+
+Caveat this layer doesn't remove: unlike the RCP (enforced above IAM,
+binding even against this account's own admin/root), a table's own resource
+policy is something this account's admin can edit or delete at will. It
+narrows the blast radius of an over-permissioned *ordinary* role; it is not
+a hard backstop against a fully compromised admin session the way the RCP
+is.
 
 ## Backlog
 

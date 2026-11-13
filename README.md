@@ -401,15 +401,6 @@ scripts/build_lambda.sh # packages the shared package into each Lambda's zip
 - **Terraform state is local-only.** No remote backend/locking - fine for a
   single operator, but blocks a second person from ever running `apply`
   safely and has no durability beyond the local `.tfstate.backup` file.
-- **The DynamoDB tables have an Org-level backstop, but no resource-based
-  policy of their own.** An Org-level RCP now denies `dynamodb:*`
-  account-wide unless the caller is in-org - see DESIGN.md's "Defense in
-  depth — protecting the DynamoDB tables directly." That only covers one
-  path, though: a resource-based policy ever granting an *external* account
-  access to `canary-keys`/`canary-events`. It does nothing about a same-org
-  principal (an over-permissioned role, a compromised admin session) reading
-  the tables directly via an ordinary identity policy - there's still no
-  resource-based policy on the tables themselves constraining that.
 - **Service-API principals aren't rate-limited per-principal.** The service
   API's own API Gateway stage has a modest shared throttle
   (`rest_api_service.tf`), but it's shared across every trusted principal,
